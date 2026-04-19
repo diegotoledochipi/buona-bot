@@ -1,439 +1,347 @@
-"""
-Buona Bot - Bot de Telegram para registro de gastos
-Conectado a Supabase (B-Gestión)
-"""
 import os
+import re
 import json
 import base64
 import logging
-import re
+import requests
 from datetime import datetime, date
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
-)
-from supabase import create_client, Client
-import anthropic
 
-# ── CONFIG ────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN")
-SUPABASE_URL    = os.environ.get("SUPABASE_URL", "https://hwiglzkkeambfekvapzr.supabase.co")
-SUPABASE_KEY    = os.environ.get("SUPABASE_KEY")
-ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY")
-ADMIN_CHAT_ID   = os.environ.get("ADMIN_CHAT_ID")  # Tu chat_id de Telegram
+# ── ENV ──────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+SUPABASE_URL    = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
+ANTHROPIC_KEY   = os.environ["ANTHROPIC_KEY"]
+ADMIN_CHAT_ID   = os.environ.get("ADMIN_CHAT_ID", "")
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-# ── CATEGORÍAS ────────────────────────────────────────────────────────────
-CATEGORIAS = {
-    # Variables
-    "Supermercado":  ["super", "supermercado", "dia", "carrefour", "coto", "vea", "mayorista", "disco", "jumbo"],
-    "Verdulería":    ["verdura", "fruta", "verdu", "verduleria", "fruteria", "limon", "tomate", "papa", "cebolla", "lechuga"],
-    "Carnicería":    ["carne", "carnes", "pollo", "cerdo", "vaca", "cordero", "bife", "asado", "costilla", "carniceria", "frigorifico", "frigo"],
-    "Congelados":    ["congelado", "freezer", "congelados"],
-    "Fiambre":       ["fiambre", "jamon", "queso", "salchicha", "panceta", "embutido", "mortadela", "salame", "lomito"],
-    "Limpieza":      ["limpieza", "detergente", "lavandina", "trapo", "escoba", "jabón", "jabon", "papel", "servilleta", "rollo"],
-    "Casa":          ["casa", "hogar", "ferreteria", "herramienta", "ferretería"],
-    "Insumos":       ["aceite", "harina", "sal", "azucar", "azúcar", "especias", "envase", "packaging", "descartable", "film", "aluminio", "bolsa"],
-    "Bebidas":       ["gaseosa", "cerveza", "vino", "agua", "jugo", "bebida", "botella", "lata", "sodas", "espirituosa"],
-    "Mantenimiento": ["plomero", "electricista", "pintor", "reparacion", "reparación", "arreglo", "mantenimiento", "gasfiter", "albañil"],
-    "Marketing":     ["meta", "facebook", "instagram", "publicidad", "imprenta", "diseño", "folleteria", "banner", "marketing"],
-    "Digital":       ["netlify", "supabase", "railway", "hosting", "dominio", "app", "subscripcion", "suscripcion"],
-    # Fijos
-    "Alquiler":      ["alquiler", "arriendo", "alq"],
-    "Impuestos":     ["impuesto", "afip", "iibb", "ingresos brutos", "iva", "municipal", "tasa", "agip", "arba"],
-    "Sueldos":       ["sueldo", "salario", "pago empleado", "empleado"],
-    "Adelantos":     ["adelanto", "anticipo"],
-    "Mensuales":     ["internet", "luz", "gas", "agua", "telefono", "teléfono", "seguro", "abono", "cuota"],
+TELEGRAM_API    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
 }
 
-CATEGORIAS_FIJAS = {"Alquiler", "Impuestos", "Sueldos", "Adelantos", "Mensuales"}
+# ── CATEGORÍAS ───────────────────────────────────────────────────────────────
+CATEGORIAS_VARIABLES = [
+    "supermercado", "verduleria", "carniceria", "congelados",
+    "fiambre", "limpieza", "casa", "insumos", "bebidas",
+    "mantenimiento", "marketing", "digital",
+]
+CATEGORIAS_FIJAS = ["alquiler", "impuestos", "sueldos", "adelantos", "mensuales"]
+TODAS_CATEGORIAS = CATEGORIAS_VARIABLES + CATEGORIAS_FIJAS
 
-def detectar_categoria(texto: str) -> str:
-    """Detecta la categoría del gasto según palabras clave."""
-    texto_lower = texto.lower()
-    for categoria, palabras in CATEGORIAS.items():
-        for palabra in palabras:
-            if palabra in texto_lower:
-                return categoria
-    return "Otros"
+# ── SUPABASE HELPERS ─────────────────────────────────────────────────────────
+def sb_insert(table: str, data: dict):
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=SUPABASE_HEADERS,
+        json=data,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
 
-def es_fijo(categoria: str) -> bool:
-    return categoria in CATEGORIAS_FIJAS
+def sb_select(table: str, params: dict = None):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=SUPABASE_HEADERS,
+        params=params or {},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
 
-def hoy() -> str:
-    return date.today().isoformat()
+# ── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
+def send_message(chat_id, text, parse_mode="Markdown"):
+    requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+        timeout=10,
+    )
 
-def mes_actual() -> str:
-    return date.today().replace(day=1).isoformat()
+def get_file_url(file_id: str) -> str:
+    r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
+    path = r.json()["result"]["file_path"]
+    return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}"
 
-def fmt_pesos(n: float) -> str:
-    return f"${int(n):,}".replace(",", ".")
-
-# ── PARSEO DE TEXTO CON IA ────────────────────────────────────────────────
-async def parsear_gasto_texto(texto: str) -> dict | None:
-    """Usa Claude para entender el gasto del mensaje."""
-    try:
-        resp = ai.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": f"""Analizá este mensaje de registro de gasto de un restaurante argentino y extraé la información.
-Respondé SOLO con JSON válido, sin texto extra:
-{{"descripcion": "nombre del gasto", "monto": 12500, "proveedor": "nombre si se menciona o null"}}
-
-Si no podés identificar un monto numérico claro, devolvé null.
-El monto siempre en números sin símbolos.
-
-Mensaje: "{texto}"
-
-Ejemplos:
-"carnes 45000 frigo" → {{"descripcion": "Carnes", "monto": 45000, "proveedor": "Frigo"}}
-"luz 18500" → {{"descripcion": "Luz", "monto": 18500, "proveedor": null}}
-"verdura mercado 3200" → {{"descripcion": "Verdura", "monto": 3200, "proveedor": "Mercado"}}"""
-            }]
-        )
-        texto_resp = resp.content[0].text.strip()
-        return json.loads(texto_resp)
-    except Exception as e:
-        logger.error(f"Error parseando gasto: {e}")
-        return None
-
-# ── PARSEO DE IMAGEN CON IA ───────────────────────────────────────────────
-async def parsear_ticket_imagen(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict | None:
-    """Usa Claude para leer un ticket/factura."""
-    try:
-        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-        resp = ai.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            messages=[{
+# ── ANTHROPIC OCR ─────────────────────────────────────────────────────────────
+def ocr_ticket(image_bytes: bytes, mime: str = "image/jpeg") -> str:
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1000,
+        "messages": [
+            {
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
-                    {"type": "text", "text": """Analizá este ticket o factura de compra y extraé la información.
-Respondé SOLO con JSON válido, sin texto extra:
-{"proveedor": "nombre del negocio", "total": 15000, "items": [{"descripcion": "producto", "monto": 5000}]}
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Sos un asistente de gestión de gastos para un restaurante argentino. "
+                            "Analizá este ticket/foto y extraé: monto total en pesos, proveedor/comercio si se ve, "
+                            "y categoría más probable entre: "
+                            + ", ".join(TODAS_CATEGORIAS)
+                            + ". Respondé SOLO en este formato JSON sin markdown:\n"
+                            '{"monto": 12500, "proveedor": "Carrefour", "categoria": "supermercado", "descripcion": "compra supermercado"}'
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    raw = r.json()["content"][0]["text"].strip()
+    # limpiar posibles backticks
+    raw = re.sub(r"```[a-z]*", "", raw).replace("```", "").strip()
+    return raw
 
-Si no podés leer el total claramente, usá la suma de los items.
-Si no hay items detallados, dejá items como lista vacía.
-Todos los montos en números enteros sin símbolos."""}
-                ]
-            }]
-        )
-        texto_resp = resp.content[0].text.strip()
-        return json.loads(texto_resp)
-    except Exception as e:
-        logger.error(f"Error parseando imagen: {e}")
+# ── PARSEO DE TEXTO ───────────────────────────────────────────────────────────
+def parse_gasto(text: str):
+    """
+    Formato esperado: 'categoria monto descripcion'
+    Ej: 'carnes 45000 frigo'
+    """
+    text = text.strip().lower()
+    tokens = text.split()
+    if len(tokens) < 2:
         return None
 
-# ── GUARDAR EN SUPABASE ───────────────────────────────────────────────────
-async def guardar_gasto(descripcion: str, monto: float, categoria: str, proveedor: str = None) -> bool:
-    """Guarda el gasto en gastos_manuales."""
-    try:
-        sb.table("gastos_manuales").insert({
-            "descripcion": descripcion,
-            "monto": monto,
-            "categoria": categoria,
-            "fecha": hoy()
-        }).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error guardando gasto: {e}")
-        return False
+    categoria = None
+    for cat in TODAS_CATEGORIAS:
+        # coincidencia parcial al inicio
+        if tokens[0].startswith(cat[:4]):
+            categoria = cat
+            break
+    if not categoria:
+        return None
 
-async def guardar_adelanto(empleado_nombre: str, monto: float) -> bool:
-    """Busca el empleado y registra el adelanto."""
-    try:
-        # Buscar empleado por nombre aproximado
-        result = sb.table("empleados").select("id, nombre").execute()
-        empleados = result.data or []
-        nombre_lower = empleado_nombre.lower()
-        empleado = next(
-            (e for e in empleados if nombre_lower in e["nombre"].lower()),
-            None
-        )
-        if not empleado:
-            return False
-        sb.table("adelantos").insert({
-            "empleado_id": empleado["id"],
-            "monto": monto,
-            "fecha": hoy(),
-            "observacion": "Cargado via bot Telegram"
-        }).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error guardando adelanto: {e}")
-        return False
-
-async def resumen_gastos(periodo: str = "hoy") -> str:
-    """Genera un resumen de gastos del período."""
-    try:
-        if periodo == "hoy":
-            desde = hoy()
-            titulo = "📊 Gastos de hoy"
-        elif periodo == "semana":
-            from datetime import timedelta
-            lunes = date.today() - timedelta(days=date.today().weekday())
-            desde = lunes.isoformat()
-            titulo = "📊 Gastos de esta semana"
-        else:  # mes
-            desde = mes_actual()
-            titulo = "📊 Gastos del mes"
-
-        result = sb.table("gastos_manuales").select("*").gte("fecha", desde).execute()
-        gastos = result.data or []
-
-        if not gastos:
-            return f"{titulo}\n\nSin gastos registrados aún."
-
-        total = sum(g["monto"] for g in gastos)
-        por_categoria = {}
-        for g in gastos:
-            cat = g.get("categoria", "Otros")
-            por_categoria[cat] = por_categoria.get(cat, 0) + g["monto"]
-
-        lineas = [f"{titulo}\n"]
-        for cat, monto in sorted(por_categoria.items(), key=lambda x: x[1], reverse=True):
-            lineas.append(f"• {cat}: {fmt_pesos(monto)}")
-        lineas.append(f"\n💰 *Total: {fmt_pesos(total)}*")
-        lineas.append(f"📝 {len(gastos)} registros")
-
-        return "\n".join(lineas)
-    except Exception as e:
-        logger.error(f"Error resumen: {e}")
-        return "Error generando resumen."
-
-# ── HANDLERS ──────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Mensaje de bienvenida."""
-    chat_id = update.effective_chat.id
-    msg = f"""🍔 *Buona Gestión Bot*
-
-¡Hola! Soy tu asistente de gastos.
-
-*Cómo usarme:*
-• Mandame un gasto: `carnes 45000 frigo`
-• Mandame una foto de un ticket
-• `/gastos` — resumen de hoy
-• `/semana` — resumen de la semana
-• `/mes` — resumen del mes
-• `/categorias` — ver todas las categorías
-• `/ayuda` — ayuda completa
-
-Tu chat ID es: `{chat_id}`"""
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_categorias(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Muestra las categorías disponibles."""
-    lineas = ["📋 *Categorías disponibles:*\n"]
-    lineas.append("*Variables:*")
-    for cat in ["Supermercado","Verdulería","Carnicería","Congelados","Fiambre",
-                "Limpieza","Casa","Insumos","Bebidas","Mantenimiento","Marketing","Digital","Otros"]:
-        lineas.append(f"  • {cat}")
-    lineas.append("\n*Fijos:*")
-    for cat in ["Alquiler","Impuestos","Sueldos","Adelantos","Mensuales"]:
-        lineas.append(f"  • {cat}")
-    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
-
-async def cmd_gastos_hoy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    resumen = await resumen_gastos("hoy")
-    await update.message.reply_text(resumen, parse_mode="Markdown")
-
-async def cmd_gastos_semana(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    resumen = await resumen_gastos("semana")
-    await update.message.reply_text(resumen, parse_mode="Markdown")
-
-async def cmd_gastos_mes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    resumen = await resumen_gastos("mes")
-    await update.message.reply_text(resumen, parse_mode="Markdown")
-
-async def cmd_ayuda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = """🤖 *Ayuda — Buona Bot*
-
-*Registrar un gasto (texto):*
-`carnes 45000`
-`verdura mercado 3200`
-`luz 18500`
-`adelanto juan 15000`
-`alquiler 280000`
-
-*Registrar un gasto (imagen):*
-Mandame una foto del ticket o factura y lo proceso automático.
-
-*Consultas:*
-/gastos — resumen de hoy
-/semana — resumen de esta semana
-/mes — resumen del mes
-/categorias — todas las categorías
-
-*Corrección:*
-Si una categoría quedó mal, respondé al mensaje con:
-`corregir [categoría correcta]`"""
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def handle_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Procesa mensajes de texto — registra gastos."""
-    texto = update.message.text.strip()
-
-    # Ignorar comandos
-    if texto.startswith("/"):
-        return
-
-    # Verificar que es el admin
-    chat_id = str(update.effective_chat.id)
-    if ADMIN_CHAT_ID and chat_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⚠️ No tenés permiso para usar este bot.")
-        return
-
-    # Mensaje de procesando
-    msg_proceso = await update.message.reply_text("⏳ Procesando...")
-
-    # Detectar si es adelanto manual directo
-    adelanto_match = re.search(r'adelanto\s+(\w+)\s+(\d+)', texto.lower())
-    if adelanto_match:
-        nombre = adelanto_match.group(1).capitalize()
-        monto = float(adelanto_match.group(2))
-        ok = await guardar_adelanto(nombre, monto)
-        if ok:
-            await msg_proceso.edit_text(
-                f"✅ *Adelanto registrado*\n👤 {nombre}\n💰 {fmt_pesos(monto)}",
-                parse_mode="Markdown"
-            )
+    # buscar monto (número con posible punto/coma)
+    monto = None
+    descripcion_tokens = []
+    for i, t in enumerate(tokens[1:], 1):
+        limpio = t.replace(".", "").replace(",", "")
+        if limpio.isdigit() and monto is None:
+            monto = int(limpio)
         else:
-            await msg_proceso.edit_text(
-                f"⚠️ No encontré al empleado *{nombre}* en el sistema.\n"
-                f"Verificá el nombre en B-Gestión.",
-                parse_mode="Markdown"
-            )
+            descripcion_tokens.append(t)
+
+    if monto is None:
+        return None
+
+    descripcion = " ".join(descripcion_tokens) if descripcion_tokens else categoria
+    return {"categoria": categoria, "monto": monto, "descripcion": descripcion}
+
+def parse_adelanto(text: str):
+    """
+    Formato: 'adelanto nombre monto'
+    Ej: 'adelanto juan 15000'
+    """
+    m = re.match(r"adelanto\s+(\w+)\s+([\d.,]+)", text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    nombre = m.group(1).capitalize()
+    monto  = int(m.group(2).replace(".", "").replace(",", ""))
+    return {"empleado": nombre, "monto": monto}
+
+# ── RESÚMENES ─────────────────────────────────────────────────────────────────
+def fmt_pesos(n) -> str:
+    return f"${int(n):,}".replace(",", ".")
+
+def resumen_gastos(filas: list) -> str:
+    if not filas:
+        return "No hay gastos registrados."
+    total = sum(f["monto"] for f in filas)
+    por_cat = {}
+    for f in filas:
+        cat = f.get("categoria", "otro")
+        por_cat[cat] = por_cat.get(cat, 0) + f["monto"]
+    lineas = [f"*{cat.capitalize()}*: {fmt_pesos(v)}" for cat, v in sorted(por_cat.items())]
+    lineas.append(f"\n*TOTAL: {fmt_pesos(total)}*")
+    return "\n".join(lineas)
+
+# ── COMANDOS ──────────────────────────────────────────────────────────────────
+def cmd_gastos(chat_id):
+    hoy = date.today().isoformat()
+    filas = sb_select("gastos_manuales", {
+        "created_at": f"gte.{hoy}T00:00:00",
+        "select": "categoria,monto,descripcion,created_at",
+        "order": "created_at.desc",
+    })
+    send_message(chat_id, f"📊 *Gastos de hoy ({hoy})*\n\n" + resumen_gastos(filas))
+
+def cmd_semana(chat_id):
+    from datetime import timedelta
+    inicio = (date.today() - timedelta(days=7)).isoformat()
+    filas = sb_select("gastos_manuales", {
+        "created_at": f"gte.{inicio}T00:00:00",
+        "select": "categoria,monto,descripcion,created_at",
+    })
+    send_message(chat_id, f"📆 *Gastos últimos 7 días*\n\n" + resumen_gastos(filas))
+
+def cmd_mes(chat_id):
+    hoy = date.today()
+    inicio = hoy.replace(day=1).isoformat()
+    filas = sb_select("gastos_manuales", {
+        "created_at": f"gte.{inicio}T00:00:00",
+        "select": "categoria,monto,descripcion,created_at",
+    })
+    send_message(chat_id, f"🗓 *Gastos de {hoy.strftime('%B %Y')}*\n\n" + resumen_gastos(filas))
+
+# ── MANEJADOR DE UPDATES ──────────────────────────────────────────────────────
+def handle_update(update: dict):
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
         return
 
-    # Parsear gasto con IA
-    datos = await parsear_gasto_texto(texto)
+    chat_id = msg["chat"]["id"]
+    text    = msg.get("text", "").strip()
+    photo   = msg.get("photo")
 
-    if not datos or not datos.get("monto"):
-        await msg_proceso.edit_text(
-            "❓ No pude identificar el monto.\n\n"
-            "Usá el formato: `descripción monto`\n"
-            "Ejemplo: `carnes 45000`",
-            parse_mode="Markdown"
+    # ── /start ────────────────────────────────────────────────────────────────
+    if text.startswith("/start"):
+        send_message(
+            chat_id,
+            f"🤖 *Buona Bot activo!*\n\nTu chat ID: `{chat_id}`\n\n"
+            "Comandos:\n"
+            "• `categoria monto descripcion` → registrar gasto\n"
+            "• `adelanto nombre monto` → registrar adelanto\n"
+            "• Foto de ticket → OCR automático\n"
+            "• `/gastos` → resumen hoy\n"
+            "• `/semana` → últimos 7 días\n"
+            "• `/mes` → mes actual",
         )
         return
 
-    descripcion = datos.get("descripcion", texto.title())
-    monto = float(datos["monto"])
-    proveedor = datos.get("proveedor")
-    categoria = detectar_categoria(texto)
-    tipo = "Fijo" if es_fijo(categoria) else "Variable"
-
-    ok = await guardar_gasto(descripcion, monto, categoria, proveedor)
-
-    if ok:
-        resp = (
-            f"✅ *Gasto registrado*\n"
-            f"📝 {descripcion}\n"
-            f"💰 {fmt_pesos(monto)}\n"
-            f"🏷️ {categoria} ({tipo})\n"
-            f"📅 {hoy()}"
-        )
-        if proveedor:
-            resp += f"\n🏪 {proveedor}"
-        await msg_proceso.edit_text(resp, parse_mode="Markdown")
-    else:
-        await msg_proceso.edit_text("❌ Error al guardar. Intentá de nuevo.")
-
-async def handle_foto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Procesa fotos de tickets/facturas."""
-    chat_id = str(update.effective_chat.id)
-    if ADMIN_CHAT_ID and chat_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("⚠️ No tenés permiso para usar este bot.")
+    # ── Comandos de resumen ───────────────────────────────────────────────────
+    if text.startswith("/gastos"):
+        cmd_gastos(chat_id)
+        return
+    if text.startswith("/semana"):
+        cmd_semana(chat_id)
+        return
+    if text.startswith("/mes"):
+        cmd_mes(chat_id)
         return
 
-    msg_proceso = await update.message.reply_text("📷 Leyendo el ticket con IA...")
+    # ── Foto / ticket ─────────────────────────────────────────────────────────
+    if photo:
+        send_message(chat_id, "📸 Procesando ticket con IA...")
+        file_id  = photo[-1]["file_id"]   # mayor resolución
+        file_url = get_file_url(file_id)
+        img_bytes = requests.get(file_url, timeout=20).content
+        try:
+            raw  = ocr_ticket(img_bytes)
+            data = json.loads(raw)
+            monto     = int(data.get("monto", 0))
+            categoria = data.get("categoria", "supermercado")
+            proveedor = data.get("proveedor", "")
+            desc      = data.get("descripcion", proveedor or categoria)
 
-    try:
-        # Obtener la foto de mayor resolución
-        foto = update.message.photo[-1]
-        file = await ctx.bot.get_file(foto.file_id)
-        image_bytes = await file.download_as_bytearray()
+            if monto <= 0:
+                send_message(chat_id, "⚠️ No pude detectar el monto. Registrá el gasto manualmente.")
+                return
 
-        datos = await parsear_ticket_imagen(bytes(image_bytes))
-
-        if not datos or not datos.get("total"):
-            await msg_proceso.edit_text(
-                "⚠️ No pude leer el total del ticket.\n"
-                "Intentá mandar el gasto como texto: `descripción monto`"
-            )
-            return
-
-        proveedor = datos.get("proveedor", "Sin nombre")
-        total = float(datos["total"])
-        items = datos.get("items", [])
-        categoria = detectar_categoria(proveedor)
-
-        # Guardar el gasto total
-        ok = await guardar_gasto(
-            f"Ticket: {proveedor}",
-            total,
-            categoria
-        )
-
-        if ok:
-            resp = (
+            sb_insert("gastos_manuales", {
+                "categoria": categoria,
+                "monto": monto,
+                "descripcion": desc,
+                "fuente": "ocr",
+            })
+            send_message(
+                chat_id,
                 f"✅ *Ticket registrado*\n"
-                f"🏪 {proveedor}\n"
-                f"💰 Total: {fmt_pesos(total)}\n"
-                f"🏷️ {categoria}\n"
-                f"📅 {hoy()}"
+                f"Categoría: {categoria.capitalize()}\n"
+                f"Monto: {fmt_pesos(monto)}\n"
+                f"Descripción: {desc}",
             )
-            if items:
-                resp += f"\n\n📋 *Detalle ({len(items)} items):*"
-                for item in items[:5]:  # Máximo 5 items en el mensaje
-                    resp += f"\n• {item['descripcion']}: {fmt_pesos(item['monto'])}"
-                if len(items) > 5:
-                    resp += f"\n_...y {len(items)-5} más_"
-            await msg_proceso.edit_text(resp, parse_mode="Markdown")
+        except Exception as e:
+            logger.error("OCR error: %s", e)
+            send_message(chat_id, "❌ No pude leer el ticket. Intentá registrar el gasto manualmente.")
+        return
+
+    # ── Adelanto ──────────────────────────────────────────────────────────────
+    if text.lower().startswith("adelanto"):
+        data = parse_adelanto(text)
+        if data:
+            sb_insert("adelantos", {
+                "empleado": data["empleado"],
+                "monto": data["monto"],
+            })
+            send_message(
+                chat_id,
+                f"✅ *Adelanto registrado*\n"
+                f"Empleado: {data['empleado']}\n"
+                f"Monto: {fmt_pesos(data['monto'])}",
+            )
         else:
-            await msg_proceso.edit_text("❌ Error al guardar el ticket.")
+            send_message(chat_id, "⚠️ Formato: `adelanto nombre monto`\nEj: `adelanto Juan 15000`")
+        return
 
-    except Exception as e:
-        logger.error(f"Error procesando foto: {e}")
-        await msg_proceso.edit_text("❌ Error procesando la imagen. Intentá de nuevo.")
+    # ── Gasto de texto ────────────────────────────────────────────────────────
+    if text and not text.startswith("/"):
+        data = parse_gasto(text)
+        if data:
+            sb_insert("gastos_manuales", {
+                "categoria": data["categoria"],
+                "monto": data["monto"],
+                "descripcion": data["descripcion"],
+                "fuente": "manual",
+            })
+            send_message(
+                chat_id,
+                f"✅ *Gasto registrado*\n"
+                f"Categoría: {data['categoria'].capitalize()}\n"
+                f"Monto: {fmt_pesos(data['monto'])}\n"
+                f"Descripción: {data['descripcion']}",
+            )
+        else:
+            send_message(
+                chat_id,
+                "⚠️ No entendí el gasto.\n\n"
+                "Formato: `categoria monto descripcion`\n"
+                "Ej: `carnes 45000 frigo`\n\n"
+                "Categorías: " + ", ".join(TODAS_CATEGORIAS),
+            )
 
-# ── MAIN ──────────────────────────────────────────────────────────────────
+# ── LONG POLLING ──────────────────────────────────────────────────────────────
 def main():
-    if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN no configurado")
-    if not SUPABASE_KEY:
-        raise ValueError("SUPABASE_KEY no configurado")
-    if not ANTHROPIC_KEY:
-        raise ValueError("ANTHROPIC_KEY no configurado")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Comandos
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ayuda", cmd_ayuda))
-    app.add_handler(CommandHandler("categorias", cmd_categorias))
-    app.add_handler(CommandHandler("gastos", cmd_gastos_hoy))
-    app.add_handler(CommandHandler("semana", cmd_gastos_semana))
-    app.add_handler(CommandHandler("mes", cmd_gastos_mes))
-
-    # Mensajes
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_texto))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_foto))
-
-    logger.info("🤖 Buona Bot iniciado")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Buona Bot iniciado con long polling")
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message", "edited_message"]}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=40)
+            updates = r.json().get("result", [])
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                try:
+                    handle_update(upd)
+                except Exception as e:
+                    logger.error("Error en update %s: %s", upd.get("update_id"), e)
+        except Exception as e:
+            logger.error("Error en polling: %s", e)
 
 if __name__ == "__main__":
     main()
