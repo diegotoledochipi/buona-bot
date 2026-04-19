@@ -3,7 +3,82 @@ import re
 import json
 import base64
 import logging
+import os
+import re
+import json
+import base64
+import logging
 import requests
+from datetime import datetime, date
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+SUPABASE_URL    = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
+ANTHROPIC_KEY   = os.environ["ANTHROPIC_KEY"]
+ADMIN_CHAT_ID   = os.environ.get("ADMIN_CHAT_ID", "")
+
+TELEGRAM_API    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+SUPABASE_HEADERS = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+}
+
+CATEGORIAS_VARIABLES = [
+        "supermercado", "panaderia", "verduleria", "carniceria", "congelados",
+        "fiambre", "limpieza", "casa", "mantenimiento", "varios", "pagos",
+]
+CATEGORIAS_FIJAS = ["alquiler", "impuestos", "sueldos", "adelantos", "mensuales"]
+TODAS_CATEGORIAS = CATEGORIAS_VARIABLES + CATEGORIAS_FIJAS
+
+def sb_insert(table, data):
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    
+def sb_select(table, params=None):
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, params=params or {}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    
+def send_message(chat_id, text):
+        requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
+    
+def get_file_url(file_id):
+        r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10)
+        path = r.json()["result"]["file_path"]
+        return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}"
+    
+def ocr_ticket(image_bytes, mime="image/jpeg"):
+        b64 = base64.b64encode(image_bytes).decode()
+        payload = {
+                    "model": "claude-sonnet-4-20250514", "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": [
+                                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                                    {"type": "text", "text": "Sos un asistente de gastos para un restaurante argentino. Analiza este ticket y extrae monto total en pesos, proveedor y categoria mas probable entre: " + ", ".join(TODAS_CATEGORIAS) + ". Responde SOLO en JSON: {\"monto\": 12500, \"proveedor\": \"Carrefour\", \"categoria\": \"supermercado\", \"descripcion\": \"compra\"}"},
+                    ]}],
+        }
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                                  headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                  json=payload, timeout=30)
+        r.raise_for_status()
+        raw = r.json()["content"][0]["text"].strip()
+        return re.sub(r"```[a-z]*", "", raw).replace("```", "").strip()
+    
+def parse_gasto(text):
+        text = text.strip().lower()
+        for ch in "aeiou":
+                    pass  # tildes ya manejadas por lower()
+                tokens = text.split()
+    if len(tokens) < 2:
+                return None
+            categoria = None
+    for cat in TODAS_CATEGORIAS:
+                if tokens[0] == cat or (len(tokens[0]) >= import requests
 from datetime import datetime, date
 
 logging.basicConfig(
